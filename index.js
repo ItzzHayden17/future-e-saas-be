@@ -96,7 +96,7 @@ function logHistory(route,action,user) {
 
 
 const serviceAccount = JSON.parse(
-  fs.readFileSync("secrets/futur-e-saas-firebase-adminsdk-fbsvc-3eac3fd621.json", "utf8")
+  fs.readFileSync("futur-e-saas-firebase-adminsdk-fbsvc-3eac3fd621.json", "utf8")
 );
 
 const mainApp = admin.initializeApp(

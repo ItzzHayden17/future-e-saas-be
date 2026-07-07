@@ -5,7 +5,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import nodemailer from "nodemailer";
 import admin from "firebase-admin";
-import serviceAccount from "./futur-e-docs-firebase-adminsdk-fbsvc-2f4fb93b31.json" with { type: "json" };
+import serviceAccount from "../futur-e-docs-firebase-adminsdk-fbsvc-2f4fb93b31.json" with { type: "json" };
 import multer from "multer";
 import { Storage } from "@google-cloud/storage";
 
