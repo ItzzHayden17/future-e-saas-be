@@ -4,6 +4,7 @@ import cors from "cors";
 import jwt from "jsonwebtoken";
 import admin from "firebase-admin";
 import fs from "fs";
+import crypto from "crypto";
 import bcrypt from "bcrypt";
 import axios from "axios";
 import nodemailer from "nodemailer";
@@ -614,14 +615,13 @@ app.post("/login", async (req, res) => {
             });
         }
 
-        const code = String(
-            Math.floor(100000 + Math.random() * 900000)
-        );
+        const code = String(crypto.randomInt(100000, 1000000));
 
         await db.collection("mfa_codes").doc(userDoc.id).set({
             code,
             expiresAt: Date.now() + 5 * 60 * 1000,
             createdAt: Date.now(),
+            attempts: 0,
         });
 
         await transporter.sendMail({
@@ -671,7 +671,7 @@ app.post("/verify-token", jwtAuth, (req, res) => {
 // CREATE USER
 // ============================================================
 
-app.post("/create-user", jwtAuth, async (req, res) => {
+app.post("/create-user", jwtAuth, requireAdmin, async (req, res) => {
     try {
         const {
             username,
@@ -955,10 +955,16 @@ app.post("/verify-email-otp", async (req, res) => {
 
         const otpData = otpDoc.data();
 
-        if (
-            Date.now() > otpData.expiresAt ||
-            String(otpData.code) !== String(code)
-        ) {
+        if (Date.now() > otpData.expiresAt || Number(otpData.attempts || 0) >= 5) {
+            await otpRef.delete();
+            return res.status(400).json({
+                status: "error",
+                message: "Invalid or expired verification code",
+            });
+        }
+
+        if (String(otpData.code) !== String(code)) {
+            await otpRef.update({ attempts: admin.firestore.FieldValue.increment(1) });
             return res.status(400).json({
                 status: "error",
                 message: "Invalid or expired verification code",
@@ -984,7 +990,7 @@ app.post("/verify-email-otp", async (req, res) => {
                 username: user.username,
             },
             process.env.JWT_SECRET,
-            { expiresIn: "1h" }
+            { expiresIn: "12h" }
         );
 
         await otpRef.delete();
@@ -1010,33 +1016,44 @@ app.post("/verify-email-otp", async (req, res) => {
 const claimsCollection = db.collection("claims");
 
 const CLAIM_FIELDS = [
-    "notificationReceived",
-    "typeOfClaim",
-    "documentsReceived",
-    "documentsDetailsOutstanding",
-    "claimToInsurer",
-    "claimRegistered",
-    "assessorAppointed",
-    "reportReceivedFromAssessor",
-    "authorizationReceived",
-    "aolReceivedReplacement",
-    "panelbeaterFollowedUp",
-    "paymentReceived",
-    "claimFinalised",
+    "claimNumber", "clientName", "claimDate", "claimType", "claimStatus",
+    "claimCategory", "thirdParty", "recoveryProvider", "progress",
+    "documentFolderId", "documentFolderPath", "finalisationDate",
+    "finalisationReason", "assessorName", "assessorPhone", "assessorEmail",
+    "assessorAppointmentDate", "notificationReceived", "typeOfClaim",
+    "documentsReceived", "documentsDetailsOutstanding", "claimToInsurer",
+    "claimRegistered", "assessorAppointed", "reportReceivedFromAssessor",
+    "authorizationReceived", "aolReceivedReplacement",
+    "panelbeaterFollowedUp", "iolFollowedUp", "paymentReceived",
+    "claimFinalised", "milestoneDates", "documentChecklist", "followUps",
+    "notes", "history", "createdAt", "updatedAt", "createdBy", "updatedBy",
 ];
 
 function sanitizeClaim(data = {}) {
     const claim = {};
-
-    for (const field of CLAIM_FIELDS) {
-        const value = data[field];
-
-        claim[field] =
-            value === undefined || value === null ? "" : String(value);
+    for (const [field, value] of Object.entries(data)) {
+        if (field === "id" || field === "password") continue;
+        if (value === undefined) continue;
+        claim[field] = value;
     }
-
+    for (const field of CLAIM_FIELDS) {
+        if (claim[field] === undefined) {
+            claim[field] = ["milestoneDates", "documentChecklist", "followUps", "notes", "history"].includes(field) ? [] : "";
+        }
+    }
     return claim;
 }
+
+function claimHistoryEntry(action, details, user) {
+    return {
+        action,
+        details,
+        user: user || "Unknown",
+        timestamp: new Date().toISOString(),
+    };
+}
+
+
 
 // GET ALL CLAIMS
 app.get("/claims", jwtAuth, async (req, res) => {
@@ -1130,7 +1147,12 @@ app.post("/claims", jwtAuth, async (req, res) => {
                 ...sanitizeClaim(item),
                 createdAt: now,
                 updatedAt: now,
+                createdBy: req.user?.username || "Unknown",
             };
+            claim.history = [
+                ...(Array.isArray(claim.history) ? claim.history : []),
+                claimHistoryEntry("Claim created", "Initial claim record created", req.user?.username),
+            ];
 
             batch.set(ref, claim);
 
@@ -1180,23 +1202,64 @@ app.patch("/claims/:id", jwtAuth, async (req, res) => {
             });
         }
 
+        const existingClaim = doc.data();
+        const now = new Date().toISOString();
+        const incoming = { ...req.body };
+        delete incoming.id;
+        const history = Array.isArray(existingClaim.history) ? [...existingClaim.history] : [];
+        const notes = Array.isArray(existingClaim.notes) ? [...existingClaim.notes] : [];
+        const followUps = Array.isArray(existingClaim.followUps) ? [...existingClaim.followUps] : [];
+        const documentChecklist = Array.isArray(existingClaim.documentChecklist) ? [...existingClaim.documentChecklist] : [];
+        const milestoneDates = Array.isArray(existingClaim.milestoneDates) ? [...existingClaim.milestoneDates] : [];
+
+        if (Array.isArray(incoming.notes)) notes.push(...incoming.notes);
+        if (Array.isArray(incoming.followUps)) followUps.push(...incoming.followUps);
+        if (Array.isArray(incoming.documentChecklist)) documentChecklist.push(...incoming.documentChecklist);
+        if (Array.isArray(incoming.milestoneDates)) milestoneDates.push(...incoming.milestoneDates);
+
+        delete incoming.notes;
+        delete incoming.followUps;
+        delete incoming.documentChecklist;
+        delete incoming.milestoneDates;
+        delete incoming.history;
+
+        const changed = Object.keys(incoming).filter((key) =>
+            JSON.stringify(existingClaim[key]) !== JSON.stringify(incoming[key])
+        );
+        if (changed.length) {
+            history.push(claimHistoryEntry(
+                "Claim updated",
+                changed.map((key) => `${key}: ${String(incoming[key] ?? "")}`).join("; "),
+                req.user?.username
+            ));
+        }
+
         const updatedClaim = {
-            ...sanitizeClaim({
-                ...doc.data(),
-                ...req.body,
-            }),
-            updatedAt: new Date().toISOString(),
+            ...existingClaim,
+            ...incoming,
+            notes,
+            followUps,
+            documentChecklist,
+            milestoneDates,
+            history,
+            updatedAt: now,
+            updatedBy: req.user?.username || "Unknown",
         };
 
-        await ref.update(updatedClaim);
+        if (incoming.claimFinalised && !existingClaim.claimFinalised) {
+            updatedClaim.finalisationDate = incoming.finalisationDate || now.slice(0, 10);
+            history.push(claimHistoryEntry("Claim finalised", updatedClaim.finalisationReason || "No reason supplied", req.user?.username));
+        }
 
-        return res.status(200).json({
-            message: "Claim updated successfully",
-            claim: {
-                id: ref.id,
-                ...updatedClaim,
-            },
-        });
+await ref.update(updatedClaim);
+
+return res.status(200).json({
+    message: "Claim updated successfully",
+    claim: {
+        id: ref.id,
+        ...updatedClaim,
+    },
+});
     } catch (error) {
         console.error("PATCH /claims/:id ERROR:", error.message);
 
@@ -1232,6 +1295,237 @@ app.delete("/claims/:id", jwtAuth, async (req, res) => {
         });
     }
 });
+
+
+// ============================================================
+// FILE DIRECTORY: CREATE FOLDERS AND UPLOAD FILES
+// ============================================================
+
+app.post("/api/folders", jwtAuth, async (req, res) => {
+    try {
+        const name = String(req.body.name || "").trim();
+        const parentPath = String(req.body.parentPath || "/root");
+        if (!name || /[\\/]/.test(name)) {
+            return res.status(400).json({ error: "A valid folder name is required" });
+        }
+        const path = `${parentPath.replace(/\/$/, "")}/${name}`;
+        const existing = await db.collection("nodes").where("path", "==", path).limit(1).get();
+        if (!existing.empty) return res.status(409).json({ error: "Folder already exists" });
+        const ref = db.collection("nodes").doc();
+        const folder = {
+            id: ref.id, name, type: "folder", path, parentPath,
+            createdAt: new Date().toISOString(),
+            lastEditedBy: req.user?.username || "Unknown",
+        };
+        await ref.set(folder);
+        return res.status(201).json(folder);
+    } catch (error) {
+        console.error("CREATE FOLDER ERROR:", error.message);
+        return res.status(500).json({ error: "Failed to create folder" });
+    }
+});
+
+app.post("/api/upload", jwtAuth, async (req, res) => {
+    try {
+        const { name, parentPath = "/root", data, contentType } = req.body;
+        if (!name || !data) return res.status(400).json({ error: "File name and file data are required" });
+        const safeName = String(name).replace(/[\\/]/g, "-");
+        const id = db.collection("nodes").doc().id;
+        const storagePath = `uploads/${id}/${safeName}`;
+        const buffer = Buffer.from(String(data).replace(/^data:.*?;base64,/, ""), "base64");
+        const file = bucket.file(storagePath);
+        await file.save(buffer, {
+            resumable: false,
+            metadata: { contentType: contentType || "application/octet-stream" },
+        });
+        const ext = safeName.includes(".") ? safeName.split(".").pop().toLowerCase() : "";
+        const ref = db.collection("nodes").doc();
+        const record = {
+            id: ref.id, name: safeName, type: "file", ext,
+            path: `${String(parentPath).replace(/\/$/, "")}/${safeName}`,
+            parentPath, filePath: storagePath,
+            size: buffer.length, createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            lastEditedBy: req.user?.username || "Unknown",
+        };
+        await ref.set(record);
+        return res.status(201).json(record);
+    } catch (error) {
+        console.error("UPLOAD FILE ERROR:", error.message);
+        return res.status(500).json({ error: "Failed to upload file" });
+    }
+});
+
+// ============================================================
+// USER ADMINISTRATION
+// ============================================================
+
+async function requireAdmin(req, res, next) {
+    try {
+        const userDoc = await db.collection("users").doc(req.user.id).get();
+        if (!userDoc.exists || !userDoc.data()?.rights?.admin) {
+            return res.status(403).json({ status: "error", message: "Administrator access required" });
+        }
+        next();
+    } catch (error) {
+        return res.status(500).json({ status: "error", message: "Could not verify administrator access" });
+    }
+}
+
+app.get("/users", jwtAuth, requireAdmin, async (req, res) => {
+    try {
+        const snapshot = await db.collection("users").get();
+        return res.json({
+            users: snapshot.docs.map((doc) => {
+                const data = doc.data();
+                return { id: doc.id, username: data.username, email: data.email, rights: data.rights || {} };
+            }),
+        });
+    } catch (error) {
+        console.error("GET USERS ERROR:", error.message);
+        return res.status(500).json({ message: "Failed to retrieve users" });
+    }
+});
+
+app.patch("/users/:id", jwtAuth, requireAdmin, async (req, res) => {
+    try {
+        const ref = db.collection("users").doc(req.params.id);
+        const doc = await ref.get();
+        if (!doc.exists) return res.status(404).json({ message: "User not found" });
+        const changes = {};
+        if (typeof req.body.email === "string") changes.email = req.body.email.trim();
+        if (req.body.rights && typeof req.body.rights === "object") changes.rights = req.body.rights;
+        if (typeof req.body.password === "string" && req.body.password.length) {
+            changes.password = await bcrypt.hash(req.body.password + (process.env.PEPPER || ""), 15);
+        }
+        await ref.update(changes);
+        return res.json({ status: "success", message: "User updated successfully" });
+    } catch (error) {
+        console.error("UPDATE USER ERROR:", error.message);
+        return res.status(500).json({ message: "Failed to update user" });
+    }
+});
+
+// ============================================================
+// MICROSOFT ONEDRIVE BACKUP
+// Requires Microsoft Graph application credentials and a drive ID.
+// ============================================================
+
+async function createOneDriveBackup() {
+    const { MICROSOFT_TENANT_ID, MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, ONEDRIVE_DRIVE_ID } = process.env;
+    if (!MICROSOFT_TENANT_ID || !MICROSOFT_CLIENT_ID || !MICROSOFT_CLIENT_SECRET || !ONEDRIVE_DRIVE_ID) {
+        console.warn("OneDrive backup skipped: Microsoft Graph environment variables are not configured.");
+        return;
+    }
+
+    const tokenResponse = await axios.post(
+        `https://login.microsoftonline.com/${MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,
+        new URLSearchParams({
+            client_id: MICROSOFT_CLIENT_ID,
+            client_secret: MICROSOFT_CLIENT_SECRET,
+            scope: "https://graph.microsoft.com/.default",
+            grant_type: "client_credentials",
+        }),
+        { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+    const token = tokenResponse.data.access_token;
+    const collectionNames = ["clients", "claims", "users", "nodes", "history"];
+    const backup = {
+        createdAt: new Date().toISOString(),
+        collections: {},
+    };
+
+    for (const collectionName of collectionNames) {
+        const snapshot = await db.collection(collectionName).get();
+        backup.collections[collectionName] = snapshot.docs.map((doc) => ({
+            id: doc.id,
+            ...doc.data(),
+        }));
+    }
+
+    const filename = `futur-e-backup-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${ONEDRIVE_DRIVE_ID}/root:/${filename}:/content`;
+    await axios.put(uploadUrl, JSON.stringify(backup), {
+        headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+        },
+        maxBodyLength: Infinity,
+    });
+    console.log(`OneDrive Firestore backup uploaded: ${filename}`);
+}
+
+app.post("/admin/backup/onedrive", jwtAuth, requireAdmin, async (req, res) => {
+    try {
+        if (!process.env.MICROSOFT_TENANT_ID || !process.env.MICROSOFT_CLIENT_ID ||
+            !process.env.MICROSOFT_CLIENT_SECRET || !process.env.ONEDRIVE_DRIVE_ID) {
+            return res.status(503).json({ status: "error", message: "Microsoft Graph / OneDrive credentials are not configured" });
+        }
+        await createOneDriveBackup();
+        return res.json({ status: "success", message: "OneDrive backup completed if Microsoft Graph is configured." });
+    } catch (error) {
+        console.error("ONEDRIVE BACKUP ERROR:", error.response?.data || error.message);
+        return res.status(500).json({ status: "error", message: "OneDrive backup failed" });
+    }
+});
+
+// Run a daily Firestore data backup when OneDrive credentials are configured.
+setInterval(() => {
+    createOneDriveBackup().catch((error) =>
+        console.error("SCHEDULED ONEDRIVE BACKUP ERROR:", error.response?.data || error.message)
+    );
+}, 24 * 60 * 60 * 1000);
+
+setTimeout(() => {
+    createOneDriveBackup().catch((error) =>
+        console.error("INITIAL ONEDRIVE BACKUP ERROR:", error.response?.data || error.message)
+    );
+}, 2 * 60 * 1000);
+
+// ============================================================
+// OVERDUE CLAIMS EMAIL REPORT
+// Configure OVERDUE_CLAIM_EMAILS as comma-separated addresses.
+// ============================================================
+
+async function sendOverdueClaimsReport() {
+    const recipients = String(process.env.OVERDUE_CLAIM_EMAILS || "")
+        .split(",").map((email) => email.trim()).filter(Boolean);
+    if (!recipients.length) return;
+    try {
+        const snapshot = await claimsCollection.get();
+        const now = Date.now();
+        const overdue = snapshot.docs.filter((doc) => {
+            const claim = doc.data();
+            if (claim.claimFinalised || claim.overdueNotificationSentAt) return false;
+            const registeredValue = claim.claimRegistered || "";
+            const registeredTimestamp = new Date(registeredValue).getTime();
+            const timestamp = Number.isFinite(registeredTimestamp)
+                ? registeredTimestamp
+                : new Date(claim.createdAt).getTime();
+            return Number.isFinite(timestamp) && now - timestamp >= 7 * 24 * 60 * 60 * 1000;
+        });
+        if (!overdue.length) return;
+        const rows = overdue.map((doc) => {
+            const c = doc.data();
+            return `<li>${String(c.claimNumber || doc.id)} — ${String(c.clientName || "Unknown client")} (registered ${String(c.claimRegistered || c.createdAt || "")})</li>`;
+        }).join("");
+        await transporter.sendMail({
+            from: process.env.EMAIL_USER,
+            to: recipients.join(","),
+            subject: `Futur-e: ${overdue.length} claim(s) open for 7 days`,
+            html: `<p>The following claims have remained open for at least seven days:</p><ul>${rows}</ul>`,
+        });
+        const batch = db.batch();
+        overdue.forEach((doc) => batch.update(doc.ref, { overdueNotificationSentAt: new Date().toISOString() }));
+        await batch.commit();
+    } catch (error) {
+        console.error("OVERDUE CLAIM REPORT ERROR:", error.message);
+    }
+}
+
+// Check daily while the backend process is running.
+setInterval(sendOverdueClaimsReport, 24 * 60 * 60 * 1000);
+setTimeout(sendOverdueClaimsReport, 60 * 1000);
 
 // ============================================================
 // ERROR HANDLER
